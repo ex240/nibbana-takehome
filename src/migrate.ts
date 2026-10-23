@@ -6,12 +6,17 @@ const STATEMENTS = [
   `ALTER TABLE queue_messages ADD COLUMN IF NOT EXISTS outcome text`,
   `DO $$
    BEGIN
+     -- Replace the check when an older migration omitted 'skipped'.
      IF NOT EXISTS (
-       SELECT 1 FROM pg_constraint WHERE conname = 'queue_messages_outcome_check'
+       SELECT 1
+       FROM pg_constraint
+       WHERE conname = 'queue_messages_outcome_check'
+         AND pg_get_constraintdef(oid) LIKE '%skipped%'
      ) THEN
+       ALTER TABLE queue_messages DROP CONSTRAINT IF EXISTS queue_messages_outcome_check;
        ALTER TABLE queue_messages
          ADD CONSTRAINT queue_messages_outcome_check
-         CHECK (outcome IS NULL OR outcome IN ('applied', 'duplicate'));
+         CHECK (outcome IS NULL OR outcome IN ('applied', 'duplicate', 'skipped'));
      END IF;
 
      IF NOT EXISTS (

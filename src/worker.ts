@@ -22,43 +22,76 @@ type Pending = {
   waitMs: number | null
 }
 
-// Next contiguous seq that is already ready. Ordered differently per process so
-// workers under contention try different stores first.
-const FIND_READY_STORES = `
-  SELECT stores.chain_id AS "chainId", stores.store_id AS "storeId"
-  FROM (
-    SELECT DISTINCT chain_id, store_id
-    FROM queue_messages
-  ) AS stores
-  LEFT JOIN store_stock AS s
-    ON s.chain_id = stores.chain_id
-   AND s.store_id = stores.store_id
-  WHERE EXISTS (
-    SELECT 1
-    FROM queue_messages AS m
+// Contiguous next receipt, or — only when that receipt is null — the earliest
+// later snapshot whose receipt is not null. A future ready_at on the next seq
+// hides every later snapshot. A future candidate hides snapshots after it.
+const FOCUS_CTE = `
+  WITH progress AS (
+    SELECT stores.chain_id, stores.store_id, COALESCE(s.last_seq, 0) AS last_seq
+    FROM (
+      SELECT DISTINCT chain_id, store_id
+      FROM queue_messages
+    ) AS stores
+    LEFT JOIN store_stock AS s
+      ON s.chain_id = stores.chain_id
+     AND s.store_id = stores.store_id
+  ),
+  next_receipt AS (
+    SELECT DISTINCT ON (p.chain_id, p.store_id)
+           p.chain_id, p.store_id, p.last_seq, r.ready_at
+    FROM progress AS p
+    JOIN queue_messages AS m
+      ON m.chain_id = p.chain_id
+     AND m.store_id = p.store_id
+     AND m.seq = p.last_seq + 1
     JOIN receipt_files AS r ON r.id = m.receipt_id
-    WHERE m.chain_id = stores.chain_id
-      AND m.store_id = stores.store_id
-      AND m.seq = COALESCE(s.last_seq, 0) + 1
-      AND r.ready_at IS NOT NULL
-      AND r.ready_at <= now()
+    ORDER BY p.chain_id, p.store_id, m.id
+  ),
+  snapshot_rows AS (
+    SELECT DISTINCT ON (n.chain_id, n.store_id, m.seq)
+           n.chain_id, n.store_id, m.seq, r.ready_at
+    FROM next_receipt AS n
+    JOIN queue_messages AS m
+      ON m.chain_id = n.chain_id
+     AND m.store_id = n.store_id
+     AND m.kind = 'snapshot'
+     AND m.seq > n.last_seq
+    JOIN receipt_files AS r ON r.id = m.receipt_id
+    WHERE n.ready_at IS NULL
+    ORDER BY n.chain_id, n.store_id, m.seq, m.id
+  ),
+  candidate AS (
+    SELECT DISTINCT ON (chain_id, store_id)
+           chain_id, store_id, ready_at
+    FROM snapshot_rows
+    WHERE ready_at IS NOT NULL
+    ORDER BY chain_id, store_id, seq
+  ),
+  focus AS (
+    SELECT n.chain_id, n.store_id,
+           CASE
+             WHEN n.ready_at IS NOT NULL THEN n.ready_at
+             ELSE c.ready_at
+           END AS ready_at
+    FROM next_receipt AS n
+    LEFT JOIN candidate AS c
+      ON c.chain_id = n.chain_id
+     AND c.store_id = n.store_id
   )
-  ORDER BY hashtextextended(stores.chain_id::text || ':' || stores.store_id::text, $1::bigint)
 `
 
-// Null ready_at is not a wait. A future ready_at on last_seq+1 is.
+// Ordered differently per process so workers under contention try different stores first.
+const FIND_READY_STORES = `
+  ${FOCUS_CTE}
+  SELECT focus.chain_id AS "chainId", focus.store_id AS "storeId"
+  FROM focus
+  WHERE focus.ready_at IS NOT NULL
+    AND focus.ready_at <= now()
+  ORDER BY hashtextextended(focus.chain_id::text || ':' || focus.store_id::text, $1::bigint)
+`
+
 const PENDING_SQL = `
-  WITH next_receipt AS (
-    SELECT DISTINCT ON (m.chain_id, m.store_id)
-           r.ready_at
-    FROM queue_messages AS m
-    JOIN receipt_files AS r ON r.id = m.receipt_id
-    LEFT JOIN store_stock AS s
-      ON s.chain_id = m.chain_id
-     AND s.store_id = m.store_id
-    WHERE m.seq = COALESCE(s.last_seq, 0) + 1
-    ORDER BY m.chain_id, m.store_id, m.id
-  )
+  ${FOCUS_CTE}
   SELECT
     (COUNT(*) FILTER (WHERE ready_at <= now()))::int AS ready,
     (
@@ -66,7 +99,7 @@ const PENDING_SQL = `
         EXTRACT(EPOCH FROM (MIN(ready_at) FILTER (WHERE ready_at > now()) - now())) * 1000
       )
     )::int AS wait_ms
-  FROM next_receipt
+  FROM focus
   WHERE ready_at IS NOT NULL
 `
 
@@ -104,8 +137,9 @@ async function readPending(client: pg.Client): Promise<Pending> {
   }
 }
 
-// True when some store's next seq is ready now or becomes ready later.
-// A null receipt does not count: this commit does not walk past it.
+// True when some store's next seq is ready or delayed, or a null next seq has
+// a snapshot candidate that is ready or delayed. A hole with no such candidate
+// does not keep the process alive.
 export async function hasActionableReceipt(client: pg.Client): Promise<boolean> {
   const pending = await readPending(client)
   return pending.ready > 0 || pending.waitMs !== null

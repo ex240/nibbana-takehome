@@ -22,6 +22,8 @@ type DeltaPayload = {
   unset?: string[]
 }
 
+type ReceiptState = 'ready' | 'future' | 'null'
+
 type QueueRow = {
   id: string
   message_id: string
@@ -30,7 +32,12 @@ type QueueRow = {
   seq: number
   kind: string
   payload: { stock?: Stock; set?: Stock; unset?: string[] }
-  ready: boolean
+  receipt: ReceiptState
+}
+
+type SeqGroup = {
+  seq: number
+  chosen: QueueRow
 }
 
 // Unset first, then set. A key named in both keeps the assigned quantity.
@@ -49,40 +56,73 @@ function canonical(rows: QueueRow[]): QueueRow {
   return rows.reduce((best, row) => (Number(row.id) < Number(best.id) ? row : best))
 }
 
-function replayStore(rows: QueueRow[]): StoreReplay {
-  const first = rows[0]
-  let stock: Stock = {}
-  const applied: AppliedUpdate[] = []
-  let expectedSeq = 1
+function groupBySeq(rows: QueueRow[]): SeqGroup[] {
+  const groups: SeqGroup[] = []
   let index = 0
-
   while (index < rows.length) {
     const seq = Number(rows[index].seq)
-    if (seq !== expectedSeq) break
-
     const atSeq: QueueRow[] = []
     while (index < rows.length && Number(rows[index].seq) === seq) {
       atSeq.push(rows[index])
       index += 1
     }
+    groups.push({ seq, chosen: canonical(atSeq) })
+  }
+  return groups
+}
 
-    const chosen = canonical(atSeq)
-    if (!chosen.ready) break
+function applyChosen(stock: Stock, row: QueueRow): Stock {
+  if (row.kind === 'snapshot') return { ...(row.payload.stock ?? {}) }
+  if (row.kind === 'delta') return applyDelta(stock, row.payload)
+  throw new Error(`unknown kind ${row.kind}`)
+}
 
-    if (chosen.kind === 'snapshot') {
-      stock = { ...(chosen.payload.stock ?? {}) }
-    } else if (chosen.kind === 'delta') {
-      stock = applyDelta(stock, chosen.payload)
-    } else {
-      throw new Error(`unknown kind ${chosen.kind}`)
+// Same walk as the processor. A future receipt stops the store. A null receipt
+// on the contiguous next seq walks later snapshots: the first non-null receipt
+// is the candidate, a future candidate waits, and a null snapshot is not a baseline.
+function replayStore(rows: QueueRow[]): StoreReplay {
+  const first = rows[0]
+  const groups = groupBySeq(rows)
+  const bySeq = new Map(groups.map((group) => [group.seq, group]))
+  let stock: Stock = {}
+  const applied: AppliedUpdate[] = []
+  let expectedSeq = 1
+
+  for (;;) {
+    const group = bySeq.get(expectedSeq)
+    if (!group) break
+
+    const chosen = group.chosen
+    if (chosen.receipt === 'future') break
+    if (chosen.receipt === 'ready') {
+      stock = applyChosen(stock, chosen)
+      applied.push({
+        messageId: chosen.message_id,
+        seq: group.seq,
+        kind: chosen.kind === 'snapshot' ? 'snapshot' : 'delta',
+      })
+      expectedSeq += 1
+      continue
+    }
+    if (chosen.receipt !== 'null') {
+      throw new Error(`unexpected receipt state ${String(chosen.receipt)}`)
     }
 
+    const candidate = groups.find(
+      (later) => later.seq > expectedSeq && later.chosen.kind === 'snapshot' && later.chosen.receipt !== 'null',
+    )
+    if (!candidate || candidate.chosen.receipt === 'future') break
+    if (candidate.chosen.receipt !== 'ready') {
+      throw new Error(`unexpected snapshot receipt state ${String(candidate.chosen.receipt)}`)
+    }
+
+    stock = { ...(candidate.chosen.payload.stock ?? {}) }
     applied.push({
-      messageId: chosen.message_id,
-      seq,
-      kind: chosen.kind,
+      messageId: candidate.chosen.message_id,
+      seq: candidate.seq,
+      kind: 'snapshot',
     })
-    expectedSeq += 1
+    expectedSeq = candidate.seq + 1
   }
 
   return {
@@ -102,7 +142,11 @@ export async function replayQueue(client: Client): Promise<StoreReplay[]> {
             m.seq,
             m.kind,
             m.payload,
-            (r.ready_at IS NOT NULL AND r.ready_at <= now()) AS ready
+            CASE
+              WHEN r.ready_at IS NULL THEN 'null'
+              WHEN r.ready_at <= now() THEN 'ready'
+              ELSE 'future'
+            END AS receipt
      FROM queue_messages m
      JOIN receipt_files r ON r.id = m.receipt_id
      ORDER BY m.chain_id, m.store_id, m.seq, m.id`,
