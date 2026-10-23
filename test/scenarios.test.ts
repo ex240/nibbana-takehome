@@ -542,6 +542,234 @@ describe('ready backlog', { concurrency: 1 }, () => {
       await client.end()
     }
   })
+
+  test('SIGKILL one worker and another finishes the run', { timeout: 300_000 }, async (t) => {
+    let fleet: FleetHandle | undefined
+    t.after(() => {
+      if (fleet && !fleet.settled) sigkillFleet(fleet)
+    })
+
+    await run('docker', ['compose', 'up', '-d', '--wait'])
+    await waitForPostgres()
+    const client = new Client({ connectionString: DATABASE_URL })
+    await client.connect()
+    try {
+      await assertOracleFile()
+      await run(process.execPath, ['seed.js'], { SEED: '42' })
+      await matureReceipts(client)
+
+      fleet = startLiveFleet()
+      const target = await waitForKillTarget(client, fleet)
+      const activity = await workerActivity(client, target.pid)
+      if (!activity) {
+        throw new Error(`no backend for worker ${target.pid}\n${await dumpActivity(client)}`)
+      }
+      const marker = await client.query<{ max: string }>(
+        `SELECT coalesce(max(apply_pos), 0)::text AS max FROM apply_log`,
+      )
+      const query = activity.query.replace(/\s+/g, ' ').slice(0, 180)
+      console.log(
+        `kill timing worker=${target.pid} backend=${activity.backend_pid} state=${activity.state} open_xact=${activity.open_xact} query=${query}`,
+      )
+      signalPid(target.pid, 'SIGKILL')
+      assert.equal(isAlive(target.supervisor), true, 'SIGKILL hit the supervisor')
+      await waitDead([target.pid])
+      assert.equal(isAlive(target.supervisor), true, 'supervisor exited with the worker')
+
+      const result = await fleet.result
+      const output = fleet.output()
+      assert.equal(result.code, 0, output)
+      assert.equal(/pause before commit/.test(output), false, output)
+      assert.match(output, new RegExp(`worker pid=${target.pid} exited code=null signal=SIGKILL`))
+      const fresh = spawnedPids(output).filter((pid) => !target.spawned.includes(pid))
+      assert.ok(fresh.length >= 1, `no replacement spawned\n${output}`)
+      assert.equal(fresh.includes(String(target.pid)), false)
+
+      const later = await client.query<{ worker_id: string }>(
+        `SELECT DISTINCT worker_id
+         FROM apply_log
+         WHERE apply_pos > $1::bigint`,
+        [marker.rows[0].max],
+      )
+      assert.ok(
+        later.rows.some((row) => row.worker_id !== String(target.pid)),
+        `no other pid applied after ${marker.rows[0].max}`,
+      )
+      await assertNoSplitApplies(client)
+      await assertMatchesOracle(client, output)
+    } finally {
+      await client.end()
+    }
+  })
+
+  test('SIGKILL the fleet and npm start again matches one uninterrupted run', { timeout: 300_000 }, async (t) => {
+    let fleet: FleetHandle | undefined
+    t.after(() => {
+      if (fleet && !fleet.settled) sigkillFleet(fleet)
+    })
+
+    await run('docker', ['compose', 'up', '-d', '--wait'])
+    await waitForPostgres()
+    const client = new Client({ connectionString: DATABASE_URL })
+    await client.connect()
+    try {
+      await assertOracleFile()
+      await run(process.execPath, ['seed.js'], { SEED: '42' })
+      await matureReceipts(client)
+      fleet = startLiveFleet()
+      const first = await fleet.result
+      const firstOutput = fleet.output()
+      assert.equal(first.code, 0, firstOutput)
+      assert.equal(/pause before commit/.test(firstOutput), false)
+      await assertMatchesOracle(client, firstOutput)
+      const uninterrupted = await captureRun(client)
+
+      await run(process.execPath, ['seed.js'], { SEED: '42' })
+      await matureReceipts(client)
+      fleet = startLiveFleet()
+      await waitForApplyCount(client, fleet, 1)
+      const killedOutput = fleet.output()
+      assert.equal(/received SIGTERM/.test(killedOutput), false, killedOutput)
+      assert.equal(/received SIGINT/.test(killedOutput), false, killedOutput)
+      const tracked = trackedOsPids(killedOutput, fleet.pid)
+      sigkillFleet(fleet)
+      await waitFleet(fleet, 10_000)
+      await waitDead(tracked)
+      await waitAppGone(client)
+      assert.equal(/received SIGTERM/.test(fleet.output()), false, fleet.output())
+      const partial = await captureRun(client)
+      assert.ok(partial.applied.length > 0, 'kill landed before any commit')
+      assert.ok(
+        partial.applied.length < uninterrupted.applied.length,
+        `kill landed after the run finished (${partial.applied.length})`,
+      )
+      const expectedIds = new Set(uninterrupted.applied.map((row) => row.message_id))
+      for (const row of partial.applied) {
+        assert.equal(expectedIds.has(row.message_id), true, row.message_id)
+      }
+      const killedSpawned = spawnedPids(fleet.output())
+      const priorWorkers = (
+        await client.query<{ worker_id: string }>(`SELECT DISTINCT worker_id FROM apply_log`)
+      ).rows.map((row) => row.worker_id)
+      for (const workerId of priorWorkers) {
+        assert.ok(killedSpawned.includes(workerId), `partial worker ${workerId}\n${fleet.output()}`)
+      }
+      const partialMax = (
+        await client.query<{ max: string }>(`SELECT coalesce(max(apply_pos), 0)::text AS max FROM apply_log`)
+      ).rows[0].max
+
+      fleet = startLiveFleet()
+      const second = await fleet.result
+      const secondOutput = fleet.output()
+      assert.equal(second.code, 0, secondOutput)
+      assert.equal(/pause before commit/.test(secondOutput), false)
+      await assertNoSplitApplies(client)
+      await assertMatchesOracle(client, secondOutput, priorWorkers)
+      const newcomers = await client.query<{ worker_id: string }>(
+        `SELECT DISTINCT worker_id FROM apply_log WHERE apply_pos > $1::bigint`,
+        [partialMax],
+      )
+      assert.ok(newcomers.rows.length > 0, 'restart applied nothing new')
+      for (const row of newcomers.rows) {
+        assert.ok(spawnedPids(secondOutput).includes(row.worker_id), `restart row applied by ${row.worker_id}`)
+      }
+      const restarted = await captureRun(client)
+      assert.deepStrictEqual(restarted.applied, uninterrupted.applied)
+      assert.deepStrictEqual(restarted.stock, uninterrupted.stock)
+
+      const beforeThird = await captureRun(client)
+      fleet = startLiveFleet()
+      const third = await fleet.result
+      const thirdOutput = fleet.output()
+      assert.equal(third.code, 0, thirdOutput)
+      assert.equal(/applied [1-9]/.test(thirdOutput), false, thirdOutput)
+      assert.deepStrictEqual(await captureRun(client), beforeThird)
+    } finally {
+      await client.end()
+    }
+  })
+
+  test('SIGKILL during a poison-gap transaction rolls the jump back', { timeout: 300_000 }, async (t) => {
+    let fleet: FleetHandle | undefined
+    t.after(() => {
+      if (fleet && !fleet.settled) sigkillFleet(fleet)
+    })
+
+    await run('docker', ['compose', 'up', '-d', '--wait'])
+    await waitForPostgres()
+    const client = new Client({ connectionString: DATABASE_URL })
+    await client.connect()
+    try {
+      await assertOracleFile()
+      await run(process.execPath, ['seed.js'], { SEED: '42' })
+      const fixture = await insertWalkFixture(client, 'failed')
+      await matureReceipts(client)
+
+      fleet = startLiveFleet({ STOCKSTREAM_PAUSE_ON_GAP_MS: '6000' })
+      const pause = await waitForMatch(
+        fleet,
+        /^pause before commit pid=(\d+) scope=gap seq=(\d+) message_id=([0-9a-f-]+)$/m,
+      )
+      const killed = Number(pause[1])
+      assert.equal(Number(pause[2]), 6)
+      assert.equal(pause[3], fixture.ids.s2)
+      const spawned = spawnedPids(fleet.output())
+      const supervisor = supervisorPidOf(fleet.output())
+      assert.ok(spawned.includes(String(killed)), fleet.output())
+      assert.notEqual(String(killed), supervisor)
+
+      const activity = await waitForGapPause(client, killed)
+      const query = activity.query.replace(/\s+/g, ' ').slice(0, 180)
+      console.log(
+        `kill timing worker=${killed} backend=${activity.backend_pid} state=${activity.state} open_xact=${activity.open_xact} scope=gap query=${query}`,
+      )
+      await assertGapUncommitted(client, fixture)
+      signalPid(killed, 'SIGKILL')
+      assert.equal(isAlive(Number(supervisor)), true)
+      await waitDead([killed])
+      await waitBackendGone(client, killed)
+      await assertGapUncommitted(client, fixture)
+
+      const result = await fleet.result
+      const output = fleet.output()
+      assert.equal(result.code, 0, output)
+      assert.match(output, new RegExp(`worker pid=${killed} exited code=null signal=SIGKILL`))
+      const fresh = spawnedPids(output).filter((pid) => !spawned.includes(pid))
+      assert.ok(fresh.length >= 1, output)
+
+      await assertNoSplitApplies(client)
+      await assertMatchesOracle(client, output)
+      const counters = await storeCounters(client, fixture.chainId, fixture.storeId)
+      assert.equal(counters.version, 3)
+      assert.equal(counters.last_seq, 6)
+      assert.deepStrictEqual(counters.stock, fixture.s2Stock)
+      const appliedBy = await client.query<{ worker_id: string }>(
+        `SELECT worker_id FROM apply_log WHERE message_id = $1::uuid`,
+        [fixture.ids.s2],
+      )
+      assert.equal(appliedBy.rows.length, 1)
+      assert.notEqual(appliedBy.rows[0].worker_id, String(killed))
+      assert.ok(spawnedPids(output).includes(appliedBy.rows[0].worker_id))
+      const outcomes = await client.query<{ seq: number; outcome: string | null; n: number }>(
+        `SELECT seq, outcome, count(*)::int AS n
+         FROM queue_messages
+         WHERE chain_id = $1::uuid AND store_id = $2::uuid
+         GROUP BY seq, outcome
+         ORDER BY seq`,
+        [fixture.chainId, fixture.storeId],
+      )
+      assert.deepStrictEqual(outcomes.rows, [
+        { seq: 1, outcome: 'applied', n: 1 },
+        { seq: 2, outcome: 'applied', n: 1 },
+        { seq: 3, outcome: 'skipped', n: 1 },
+        { seq: 4, outcome: 'skipped', n: 1 },
+        { seq: 5, outcome: 'skipped', n: 1 },
+        { seq: 6, outcome: 'applied', n: 1 },
+      ])
+    } finally {
+      await client.end()
+    }
+  })
 })
 
 async function assertFleet(
@@ -1128,4 +1356,414 @@ async function assertWalkStore(client: pg.Client, fixture: WalkFixture, mode: 'd
     { seq: 5, outcome: 'skipped', n: 1 },
     { seq: 6, outcome: 'applied', n: 1 },
   ])
+}
+
+type FleetHandle = {
+  pid: number
+  readonly settled: boolean
+  output: () => string
+  result: Promise<{ code: number | null; signal: NodeJS.Signals | null }>
+}
+
+type ActivityRow = {
+  backend_pid: number
+  application_name: string
+  state: string
+  open_xact: boolean
+  query: string
+}
+
+type AppliedPicture = {
+  message_id: string
+  chain_id: string
+  store_id: string
+  seq: number
+  kind: string
+}
+
+type StockPicture = {
+  chain_id: string
+  store_id: string
+  stock: Stock
+  version: number
+  last_seq: number
+}
+
+type RunPicture = {
+  stock: StockPicture[]
+  applied: AppliedPicture[]
+}
+
+function startLiveFleet(extra: Record<string, string> = {}): FleetHandle {
+  let output = ''
+  let settled = false
+  const child = spawn('npm', ['start'], {
+    cwd: root,
+    env: { ...process.env, ...extra },
+    stdio: ['ignore', 'pipe', 'pipe'],
+    detached: true,
+  })
+  const pid = child.pid
+  if (pid === undefined) throw new Error('npm start did not spawn')
+  child.stdout?.on('data', (chunk: Buffer) => {
+    output += chunk.toString()
+  })
+  child.stderr?.on('data', (chunk: Buffer) => {
+    output += chunk.toString()
+  })
+  const result = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+    child.once('error', reject)
+    child.once('close', (code, signal) => {
+      settled = true
+      resolve({ code, signal })
+    })
+  })
+  result.catch(() => {
+    // Callers that still care await `result`. Cleanup may kill the process later.
+  })
+  return {
+    pid,
+    get settled() {
+      return settled
+    },
+    output: () => output,
+    result,
+  }
+}
+
+function spawnedPids(output: string): string[] {
+  return [...output.matchAll(/^spawned worker pid=(\d+)$/gm)].map((match) => match[1])
+}
+
+function supervisorPidOf(output: string): string {
+  const match = output.match(/^supervisor pid=(\d+)$/m)
+  assert.ok(match, output)
+  return match[1]
+}
+
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function signalPid(pid: number, signal: NodeJS.Signals): void {
+  try {
+    process.kill(pid, signal)
+  } catch (err) {
+    if (err instanceof Error && 'code' in err && err.code === 'ESRCH') return
+    throw err
+  }
+}
+
+function trackedOsPids(output: string, npmPid: number): number[] {
+  const pids = new Set<number>([npmPid])
+  const supervisor = output.match(/^supervisor pid=(\d+)$/m)
+  if (supervisor) pids.add(Number(supervisor[1]))
+  for (const worker of spawnedPids(output)) pids.add(Number(worker))
+  return [...pids]
+}
+
+function sigkillFleet(fleet: FleetHandle): void {
+  const output = fleet.output()
+  const workers = spawnedPids(output).map((pid) => Number(pid))
+  const supervisor = output.match(/^supervisor pid=(\d+)$/m)
+  if (fleet.pid > 0) signalPid(-fleet.pid, 'SIGKILL')
+  for (const worker of workers) signalPid(worker, 'SIGKILL')
+  if (supervisor) signalPid(Number(supervisor[1]), 'SIGKILL')
+}
+
+async function waitDead(pids: number[]): Promise<void> {
+  const deadline = Date.now() + 10_000
+  while (Date.now() < deadline) {
+    if (pids.every((pid) => !isAlive(pid))) return
+    await sleep(20)
+  }
+  const alive = pids.filter((pid) => isAlive(pid))
+  throw new Error(`still alive after SIGKILL: ${alive.join(',')}`)
+}
+
+async function assertOracleFile(): Promise<void> {
+  const oracleSource = await fs.readFile(new URL('./oracle.ts', import.meta.url), 'utf8')
+  assert.equal(
+    /(?:import|require)\s*(?:[^'"\n]*from\s*)?['"][^'"]*src(?:\/|['"])/.test(oracleSource),
+    false,
+  )
+}
+
+async function matureReceipts(client: pg.Client): Promise<void> {
+  await client.query(
+    `UPDATE receipt_files
+     SET ready_at = now() - interval '1 hour'
+     WHERE ready_at IS NOT NULL`,
+  )
+}
+
+async function workerActivity(client: pg.Client, workerPid: number): Promise<ActivityRow | null> {
+  const result = await client.query<ActivityRow>(
+    `SELECT pid::int AS backend_pid,
+            application_name,
+            coalesce(state, '') AS state,
+            xact_start IS NOT NULL AS open_xact,
+            left(coalesce(query, ''), 300) AS query
+     FROM pg_stat_activity
+     WHERE application_name = $1`,
+    [`stockstream-worker-${workerPid}`],
+  )
+  return result.rows[0] ?? null
+}
+
+async function dumpActivity(client: pg.Client): Promise<string> {
+  const result = await client.query(
+    `SELECT pid, application_name, state, xact_start IS NOT NULL AS open_xact, left(query, 120) AS query
+     FROM pg_stat_activity
+     WHERE datname = current_database()
+     ORDER BY pid`,
+  )
+  return JSON.stringify(result.rows)
+}
+
+async function waitBackendGone(client: pg.Client, workerPid: number): Promise<void> {
+  const deadline = Date.now() + 10_000
+  while (Date.now() < deadline) {
+    if ((await workerActivity(client, workerPid)) === null) return
+    await sleep(20)
+  }
+  throw new Error(`backend for worker ${workerPid} still connected\n${await dumpActivity(client)}`)
+}
+
+async function waitAppGone(client: pg.Client): Promise<void> {
+  const deadline = Date.now() + 10_000
+  while (Date.now() < deadline) {
+    const result = await client.query<{ n: number }>(
+      `SELECT count(*)::int AS n
+       FROM pg_stat_activity
+       WHERE application_name LIKE 'stockstream-%'`,
+    )
+    if (result.rows[0].n === 0) return
+    await sleep(30)
+  }
+  throw new Error(`stockstream backends still connected\n${await dumpActivity(client)}`)
+}
+
+async function waitFleet(
+  fleet: FleetHandle,
+  ms: number,
+): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  let timer: NodeJS.Timeout | undefined
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`fleet still running after SIGKILL\n${fleet.output()}`))
+    }, ms)
+  })
+  try {
+    return await Promise.race([fleet.result, timeout])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+async function waitForApplyCount(client: pg.Client, fleet: FleetHandle, min: number): Promise<number> {
+  const deadline = Date.now() + 20_000
+  while (Date.now() < deadline) {
+    if (fleet.settled) throw new Error(`fleet exited before kill\n${fleet.output()}`)
+    const output = fleet.output()
+    const count = await client.query<{ n: number }>(`SELECT count(*)::int AS n FROM apply_log`)
+    const supervisor = output.match(/^supervisor pid=(\d+)$/m)
+    if (count.rows[0].n >= min && spawnedPids(output).length >= 4 && supervisor) return count.rows[0].n
+    await sleep(20)
+  }
+  throw new Error(`timed out waiting for apply_log\n${fleet.output()}`)
+}
+
+type KillTarget = {
+  pid: number
+  supervisor: number
+  spawned: string[]
+}
+
+async function waitForKillTarget(client: pg.Client, fleet: FleetHandle): Promise<KillTarget> {
+  const deadline = Date.now() + 20_000
+  while (Date.now() < deadline) {
+    if (fleet.settled) throw new Error(`fleet exited before kill\n${fleet.output()}`)
+    const spawned = spawnedPids(fleet.output())
+    let supervisor = ''
+    try {
+      supervisor = supervisorPidOf(fleet.output())
+    } catch {
+      supervisor = ''
+    }
+    const count = await client.query<{ n: number }>(`SELECT count(*)::int AS n FROM apply_log`)
+    if (count.rows[0].n > 0 && spawned.length >= 4 && supervisor) {
+      const writers = await client.query<{ worker_id: string }>(`SELECT DISTINCT worker_id FROM apply_log`)
+      const alive = spawned.filter((pid) => isAlive(Number(pid)) && pid !== supervisor)
+      const writer = alive.find((pid) => writers.rows.some((row) => row.worker_id === pid))
+      const pick = writer ?? alive[0]
+      if (pick) return { pid: Number(pick), supervisor: Number(supervisor), spawned }
+    }
+    await sleep(20)
+  }
+  throw new Error(`timed out waiting for a worker to kill\n${fleet.output()}`)
+}
+
+async function waitForMatch(fleet: FleetHandle, pattern: RegExp, ms = 20_000): Promise<RegExpMatchArray> {
+  const deadline = Date.now() + ms
+  while (Date.now() < deadline) {
+    if (fleet.settled) throw new Error(`fleet exited\n${fleet.output()}`)
+    const match = fleet.output().match(pattern)
+    if (match) return match
+    await sleep(20)
+  }
+  throw new Error(`timed out waiting for ${pattern}\n${fleet.output()}`)
+}
+
+async function waitForGapPause(client: pg.Client, workerPid: number): Promise<ActivityRow> {
+  const deadline = Date.now() + 2_000
+  let last: ActivityRow | null = null
+  while (Date.now() < deadline) {
+    last = await workerActivity(client, workerPid)
+    if (last && last.state === 'idle in transaction' && last.open_xact && /duplicate/.test(last.query)) {
+      return last
+    }
+    await sleep(20)
+  }
+  throw new Error(`expected an open gap transaction, saw ${JSON.stringify(last)}\n${await dumpActivity(client)}`)
+}
+
+async function assertGapUncommitted(client: pg.Client, fixture: WalkFixture): Promise<void> {
+  const row = await client.query<{ version: number; last_seq: number; stock: Stock }>(
+    `SELECT version, last_seq, stock
+     FROM store_stock
+     WHERE chain_id = $1::uuid AND store_id = $2::uuid`,
+    [fixture.chainId, fixture.storeId],
+  )
+  assert.equal(row.rows.length, 1)
+  assert.equal(Number(row.rows[0].version), 2)
+  assert.equal(Number(row.rows[0].last_seq), 2)
+  assert.deepStrictEqual(row.rows[0].stock, { 'SKU-4711': 3, 'SKU-1002': 2 })
+  const marked = await client.query<{ n: number }>(
+    `SELECT count(*)::int AS n
+     FROM queue_messages
+     WHERE chain_id = $1::uuid AND store_id = $2::uuid
+       AND seq >= 3
+       AND outcome IS NOT NULL`,
+    [fixture.chainId, fixture.storeId],
+  )
+  assert.equal(marked.rows[0].n, 0)
+  const logged = await client.query<{ n: number }>(
+    `SELECT count(*)::int AS n FROM apply_log WHERE message_id = $1::uuid`,
+    [fixture.ids.s2],
+  )
+  assert.equal(logged.rows[0].n, 0)
+}
+
+async function assertNoSplitApplies(client: pg.Client): Promise<void> {
+  const dup = await client.query<{ n: number }>(
+    `SELECT count(*)::int AS n
+     FROM (
+       SELECT message_id FROM apply_log GROUP BY message_id HAVING count(*) > 1
+     ) d`,
+  )
+  assert.equal(dup.rows[0].n, 0)
+  const versions = await client.query<{ n: number }>(
+    `SELECT count(*)::int AS n
+     FROM store_stock s
+     WHERE s.version <> (
+       SELECT count(*)::int FROM apply_log a
+       WHERE a.chain_id = s.chain_id AND a.store_id = s.store_id
+     )`,
+  )
+  assert.equal(versions.rows[0].n, 0)
+}
+
+async function captureRun(client: pg.Client): Promise<RunPicture> {
+  const stock = await client.query<StockPicture>(
+    `SELECT chain_id::text, store_id::text, stock, version, last_seq
+     FROM store_stock
+     ORDER BY chain_id, store_id`,
+  )
+  const applied = await client.query<AppliedPicture>(
+    `SELECT message_id::text, chain_id::text, store_id::text, seq, kind
+     FROM apply_log
+     ORDER BY chain_id, store_id, seq, message_id`,
+  )
+  return { stock: stock.rows, applied: applied.rows }
+}
+
+async function assertMatchesOracle(
+  client: pg.Client,
+  output: string,
+  priorWorkers: readonly string[] = [],
+): Promise<void> {
+  await assertOracleFile()
+  const supervisor = supervisorPidOf(output)
+  const spawned = spawnedPids(output)
+  const allowedWorkers = new Set([...spawned, ...priorWorkers])
+  assert.ok(spawned.length >= 4, output)
+
+  const expected = await replayQueue(client)
+  const stockRows = await client.query<{
+    chain_id: string
+    store_id: string
+    stock: Stock
+    version: number
+    last_seq: number
+  }>(
+    `SELECT chain_id::text, store_id::text, stock, version, last_seq
+     FROM store_stock`,
+  )
+  const logRows = await client.query<{
+    message_id: string
+    chain_id: string
+    store_id: string
+    seq: number
+    kind: string
+    worker_id: string
+  }>(
+    `SELECT message_id::text, chain_id::text, store_id::text, seq, kind, worker_id
+     FROM apply_log
+     ORDER BY apply_pos`,
+  )
+
+  const actualByStore = new Map(stockRows.rows.map((row) => [`${row.chain_id}:${row.store_id}`, row]))
+  const logByStore = new Map<string, typeof logRows.rows>()
+  for (const row of logRows.rows) {
+    const key = `${row.chain_id}:${row.store_id}`
+    const list = logByStore.get(key)
+    if (list) list.push(row)
+    else logByStore.set(key, [row])
+  }
+
+  const seenMessages = new Set<string>()
+  for (const store of expected) {
+    const key = `${store.chainId}:${store.storeId}`
+    const logged = logByStore.get(key) ?? []
+    if (store.applied.length === 0) {
+      assert.equal(actualByStore.has(key), false, key)
+      assert.equal(logged.length, 0, key)
+      continue
+    }
+    const actual = actualByStore.get(key)
+    assert.ok(actual, `missing store_stock for ${key}`)
+    assert.deepStrictEqual(actual.stock, store.stock, key)
+    assert.equal(actual.version, store.applied.length, key)
+    assert.equal(actual.version, logged.length, key)
+    assert.equal(actual.last_seq, store.applied[store.applied.length - 1].seq, key)
+    assert.deepStrictEqual(
+      logged.map((row) => ({ messageId: row.message_id, seq: row.seq, kind: row.kind })),
+      store.applied,
+      key,
+    )
+    for (const row of logged) {
+      assert.equal(seenMessages.has(row.message_id), false, row.message_id)
+      seenMessages.add(row.message_id)
+      assert.notEqual(row.worker_id, supervisor, row.message_id)
+      assert.ok(allowedWorkers.has(row.worker_id), `worker ${row.worker_id}`)
+    }
+  }
+  assert.equal(logByStore.size, expected.filter((store) => store.applied.length > 0).length)
+  assert.equal(seenMessages.size, logRows.rows.length)
 }

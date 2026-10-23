@@ -190,7 +190,10 @@ export async function drainQueue(client: pg.Client): Promise<number> {
 }
 
 export async function main(): Promise<void> {
-  const client = new Client({ connectionString: DATABASE_URL })
+  const client = new Client({
+    connectionString: DATABASE_URL,
+    application_name: `stockstream-worker-${process.pid}`,
+  })
   await client.connect()
   try {
     await migrate(client)

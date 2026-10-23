@@ -1,4 +1,5 @@
 import { fork, type ChildProcess } from 'node:child_process'
+import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import pg from 'pg'
@@ -86,7 +87,7 @@ export async function supervise(client: pg.Client): Promise<number> {
     live += 1
     children.add(child)
     // The fork carries no store and no message. Postgres assigns the work.
-    console.log(`spawned worker pid=${child.pid}`)
+    fs.writeSync(1, `spawned worker pid=${child.pid}\n`)
 
     let settled = false
     const finish = (code: number | null, signal: NodeJS.Signals | null): void => {
@@ -103,7 +104,7 @@ export async function supervise(client: pg.Client): Promise<number> {
     })
   }
 
-  console.log(`supervisor pid=${process.pid}`)
+  fs.writeSync(1, `supervisor pid=${process.pid}\n`)
   console.log(`fleet size=${FLEET_SIZE}`)
   for (let i = 0; i < FLEET_SIZE; i += 1) spawnOne()
 
@@ -114,7 +115,9 @@ export async function supervise(client: pg.Client): Promise<number> {
     live -= 1
     const codeText = done.code === null ? 'null' : String(done.code)
     console.log(`worker pid=${done.pid} exited code=${codeText} signal=${done.signal ?? ''}`)
-    if (done.code !== 0) failure = failure ?? (done.code === null ? 1 : done.code)
+    // SIGKILL drops the connection and rolls the open transaction back. The
+    // replacement finishes the run, so a signal is not a failed exit code.
+    if (done.code !== null && done.code !== 0) failure = failure ?? done.code
 
     const remains = await hasActionableReceipt(client)
     if (remains && !stopping) spawnOne()
@@ -124,7 +127,10 @@ export async function supervise(client: pg.Client): Promise<number> {
 }
 
 export async function main(): Promise<number> {
-  const client = new Client({ connectionString: DATABASE_URL })
+  const client = new Client({
+    connectionString: DATABASE_URL,
+    application_name: `stockstream-supervisor-${process.pid}`,
+  })
   await client.connect()
   try {
     const started = await client.query<{ epoch: string }>(

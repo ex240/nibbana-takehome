@@ -1,3 +1,4 @@
+import fs from 'node:fs'
 import type { Client } from 'pg'
 
 export type ApplyStatus = 'applied' | 'caught-up' | 'not-ready' | 'locked' | 'conflict'
@@ -161,7 +162,25 @@ async function resumeAtSnapshot(
 
   await markGapSkipped(client, chainId, storeId, lastSeq, snapSeq)
   await recordApplied(client, chainId, storeId, snapSeq, candidate, atSeq.length)
+  // After the stock update, the skipped marks, and the apply_log insert, still
+  // before COMMIT. Off unless STOCKSTREAM_PAUSE_ON_GAP_MS is set.
+  await pauseBeforeGapCommit(snapSeq, candidate.message_id)
   return 'applied'
+}
+
+let gapPauseUsed = false
+
+async function pauseBeforeGapCommit(seq: number, messageId: string): Promise<void> {
+  if (gapPauseUsed) return
+  const raw = process.env.STOCKSTREAM_PAUSE_ON_GAP_MS
+  if (raw === undefined || raw === '') return
+  const ms = Number(raw)
+  if (!Number.isFinite(ms) || ms < 1) return
+  gapPauseUsed = true
+  fs.writeSync(1, `pause before commit pid=${process.pid} scope=gap seq=${seq} message_id=${messageId}\n`)
+  await new Promise((resolve) => {
+    setTimeout(resolve, ms)
+  })
 }
 
 async function recordApplied(
