@@ -251,6 +251,66 @@ describe('ready backlog', { concurrency: 1 }, () => {
          ) bad`,
       )
       assert.equal(seqMarks.rows[0].n, 0)
+
+      const beforeRerun = await client.query<{
+        stock_rows: number
+        log_rows: number
+        version_sum: string
+        last_seq_sum: string
+      }>(
+        `SELECT
+           (SELECT count(*)::int FROM store_stock) AS stock_rows,
+           (SELECT count(*)::int FROM apply_log) AS log_rows,
+           (SELECT coalesce(sum(version), 0)::text FROM store_stock) AS version_sum,
+           (SELECT coalesce(sum(last_seq), 0)::text FROM store_stock) AS last_seq_sum`,
+      )
+      const stockBeforeRerun = await client.query(
+        `SELECT chain_id::text, store_id::text, stock, version, last_seq
+         FROM store_stock
+         ORDER BY chain_id, store_id`,
+      )
+      const logBeforeRerun = await client.query(
+        `SELECT apply_pos, message_id::text, chain_id::text, store_id::text, seq, kind, worker_id
+         FROM apply_log
+         ORDER BY apply_pos`,
+      )
+
+      child = spawn(process.execPath, ['--import', 'tsx', 'src/worker.ts'], {
+        cwd: root,
+        env: process.env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      let secondOutput = ''
+      child.stdout?.on('data', (chunk: Buffer) => {
+        secondOutput += chunk.toString()
+      })
+      child.stderr?.on('data', (chunk: Buffer) => {
+        secondOutput += chunk.toString()
+      })
+      const [secondCode] = (await once(child, 'exit')) as [number | null]
+      assert.equal(secondCode, 0, secondOutput)
+      assert.match(secondOutput, /applied 0/)
+
+      const afterRerun = await client.query(
+        `SELECT
+           (SELECT count(*)::int FROM store_stock) AS stock_rows,
+           (SELECT count(*)::int FROM apply_log) AS log_rows,
+           (SELECT coalesce(sum(version), 0)::text FROM store_stock) AS version_sum,
+           (SELECT coalesce(sum(last_seq), 0)::text FROM store_stock) AS last_seq_sum`,
+      )
+      const stockAfterRerun = await client.query(
+        `SELECT chain_id::text, store_id::text, stock, version, last_seq
+         FROM store_stock
+         ORDER BY chain_id, store_id`,
+      )
+      const logAfterRerun = await client.query(
+        `SELECT apply_pos, message_id::text, chain_id::text, store_id::text, seq, kind, worker_id
+         FROM apply_log
+         ORDER BY apply_pos`,
+      )
+      assert.deepStrictEqual(afterRerun.rows, beforeRerun.rows)
+      assert.deepStrictEqual(stockAfterRerun.rows, stockBeforeRerun.rows)
+      assert.deepStrictEqual(logAfterRerun.rows, logBeforeRerun.rows)
     } finally {
       if (child && child.exitCode === null && !child.killed) child.kill('SIGTERM')
       await client.end()
