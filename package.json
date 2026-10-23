@@ -7,7 +7,7 @@
   },
   "scripts": {
     "seed": "node seed.js",
-    "start": "tsx src/worker.ts",
+    "start": "tsx src/supervisor.ts",
     "test": "node --import tsx --test test/scenarios.test.ts"
   },
   "dependencies": {

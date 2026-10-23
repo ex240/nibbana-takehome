@@ -33,6 +33,9 @@ const STATEMENTS = [
 export async function migrate(client: Client): Promise<void> {
   await client.query('BEGIN')
   try {
+    // Two-int locks are a different keyspace from the bigint store locks, so
+    // startup cannot block (or be blocked by) an apply already in progress.
+    await client.query('SELECT pg_advisory_xact_lock(481516234, 20261023)')
     for (const statement of STATEMENTS) {
       await client.query(statement)
     }
